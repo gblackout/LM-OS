@@ -1,0 +1,22 @@
+python sft.py \
+    --base_model "storage/models/hugging_face_models/Meta-Llama-3.1-8B-Instruct" \
+    --data_path "data/compress_demo_data.json" \
+    --output_dir "logs/compress_demo" \
+    --val_size 300 \
+    --batch_size 32 \
+    --micro_batch_size 4 \
+    --num_epochs 3 \
+    --warmup_steps 5 \
+    --eval_steps 10000 \
+    --save_steps 10 \
+    --save_total_limit 30 \
+    --load_in_8bit \
+    --learning_rate 3e-4 \
+    --max_length 2048 \
+    --lora_r 64 \
+    --lora_alpha 64 \
+    --lora_dropout 0.05 \
+    --lora_target_modules '[q_proj,k_proj,v_proj,o_proj,gate_proj,down_proj,up_proj]' \
+    --use_wandb=False \
+    --wandb_project tiger_8b_sft \
+    --wandb_run_name default_run

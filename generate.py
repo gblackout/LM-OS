@@ -157,10 +157,11 @@ def simple_generate_with_tokenization(
     tokenizer: Union[MyLlamaTokenizer, LlamaTokenizer],
     max_new_tokens: int,
     generation_config: Optional[GenerationConfig] = None,
-    skip_special_tokens: bool = True
+    skip_special_tokens: bool = True,
+    **tokenizer_kwargs
 ):
 
-    inputs = tokenizer(input_str)
+    inputs = tokenizer(input_str, **tokenizer_kwargs)
     input_ids = inputs['input_ids'].to('cuda')
     input_id_len = len(input_ids[0])
 
