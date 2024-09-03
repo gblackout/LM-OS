@@ -1,6 +1,8 @@
 import json
 import os
 from typing import List, Optional
+
+import torch
 import transformers
 from datasets import load_dataset
 import logging
@@ -41,6 +43,33 @@ def prepare_dataset(data_path, val_data_path, tokenizerlm, val_size):
         with open(save_fp, 'w') as f:
             json.dump(data, f)
 
+    def ret_demo_tokenize(sample):
+        main_dict = tokenizerlm(
+            [
+                [sample['input'], 'False'],
+                [sample['label'], 'True'],
+            ],
+            add_bos=False,
+            add_eos=False,
+            single_dim=True,
+            my_token2llama_token=True
+        )
+        ctx_ls = [s.replace(tokenizerlm.MY_EOS_TOKEN, tokenizerlm.llama_tokenizer.eos_token) for s in sample['ctx_ls']]
+        ctx_ids = tokenizerlm.llama_tokenizer(
+            ctx_ls,
+            padding=True,
+            pad_to_multiple_of=8,
+            add_special_tokens=False,
+            return_tensors='pt'
+        )
+        main_dict['ctx_ids'] = ctx_ids['input_ids']
+        main_dict['ctx_attention_masks'] = ctx_ids['attention_mask']
+        main_dict['compression_factor'] = 1
+        main_dict['is_demo_retrival'] = True
+        main_dict['relevant_ctx_ids'] = torch.tensor(sample['relevant_ctx_ids'])
+
+        return main_dict
+
     def tokenize(sample):
         main_dict = tokenizerlm(
             [
@@ -66,10 +95,13 @@ def prepare_dataset(data_path, val_data_path, tokenizerlm, val_size):
     data_files = {'train': processed_train_fp, 'test': processed_valid_fp}
     data = load_dataset("json", data_files=data_files)
 
-    train_data = data['train'].shuffle().map(tokenize)
-    val_data = data['test'].shuffle().map(tokenize)
+    # train_data = data['train'].shuffle().map(tokenize)
+    # val_data = data['test'].shuffle().map(tokenize)
 
-    remove_cols = ['input', 'label', 'src', 'ctx']
+    train_data = data['train'].shuffle().map(ret_demo_tokenize)
+    val_data = data['test'].shuffle().map(ret_demo_tokenize)
+
+    remove_cols = ['input', 'label', 'src', 'ctx_ls']
     train_data = train_data.remove_columns(remove_cols)
     val_data = val_data.remove_columns(remove_cols)
 
@@ -168,7 +200,7 @@ def train(
         args=transformers.TrainingArguments(
             per_device_train_batch_size=micro_batch_size,
             per_device_eval_batch_size=1, # TODO adhoc
-            eval_accumulation_steps=32, # TODO adhoc
+            eval_accumulation_steps=4, # TODO adhoc
             gradient_accumulation_steps=batch_size // micro_batch_size,
             warmup_steps=warmup_steps,
             num_train_epochs=num_epochs,

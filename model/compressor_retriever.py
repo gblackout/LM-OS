@@ -134,7 +134,8 @@ class CompressorRetriever(PreTrainedModel):
             attention_mask: Optional[torch.Tensor] = None,
             is_generation: bool = False,
             is_demo_retrival: bool = False,
-            ctx_seg_inds: Optional[List] = None,
+            ctx_attention_masks: Optional[List] = None,
+            relevant_ctx_ids: Optional[torch.LongTensor] = None,
             **kwargs
     ):
         assert not all_exists(input_ids, inputs_embeds), 'you should only give either input_ids or inputs_embeds'
@@ -147,24 +148,39 @@ class CompressorRetriever(PreTrainedModel):
             raise ValueError(f'you should give either input_ids or inputs_embeds')
 
         if is_demo_retrival:
-            assert all_exists(ctx_seg_inds)
 
             input_state = self.compress(inputs_embeds=embedded, output_len=1) # TODO ad hoc state 1
-
+            bsize = ctx_ids.shape[0]
             # build the mem tree
             full_mem_trees = []
-            for s, e in ctx_seg_inds:
+            n_ctx = ctx_ids.shape[1]
+            for ctx_ind in range(n_ctx): # TODO no batch here
                 seg_mem_tree = []
-                cur_seg = self.base_causallm.get_input_embeddings()(ctx_ids[:, s:e])
+                ctx_id = ctx_ids[:, ctx_ind, :]
+                cur_seg = self.base_causallm.get_input_embeddings()(ctx_id)
                 # TODO sth wrong with compression_factor, can't get element of it nor do anything
                 for factor in [1, 'single']:
                     if factor == 'single':
                         output_len = 1
-                    else:
-                        output_len = int(cur_seg.shape[1] / factor)
+                        cur_seg = torch.cat([input_state, cur_seg], dim=1)  # (bsize, len, dim)
+                        com_embeds = self.compress(inputs_embeds=cur_seg,output_len=output_len,)
 
-                    cur_seg = torch.cat([input_state, cur_seg], dim=1) # (bsize, len, dim)
-                    com_embeds = self.compress(inputs_embeds=cur_seg, output_len=output_len)
+                    else:
+                        output_len = 50 # TODO instead of int(cur_seg.shape[1] / factor), we use 50 to cut down cost
+                        cur_seg = torch.cat([input_state, cur_seg], dim=1)  # (bsize, len, dim)
+                        ctx_attention_mask = torch.cat(
+                            [
+                                torch.full(input_state.shape[:2], 1).to(input_state.device),
+                                ctx_attention_masks[:, ctx_ind, :],
+                                torch.full((bsize, output_len), 1).to(input_state.device),
+                            ],
+                            dim=1
+                        )
+                        com_embeds = self.compress(
+                            inputs_embeds=cur_seg,
+                            output_len=output_len,
+                            attention_mask=ctx_attention_mask
+                        )
 
                     seg_mem_tree.append(com_embeds)
                     cur_seg = com_embeds
@@ -187,7 +203,9 @@ class CompressorRetriever(PreTrainedModel):
                 return_dict=True,
             )
             assert isinstance(outputs, BaseModelOutputWithPast)
-            attn = outputs.attentions[-1]
+            attn = outputs.attentions[-1] # (bsize, n_head, mem_len+q_len, mem_len+q_len)
+            # TODO i'm not sure if averaging is good
+            attn = attn.mean(dim=1)
 
             # Get the attention scores for the last m rows and the first n columns
             attn_last_m_first_n = attn[:, mem_len:, :mem_len]  # (b, q_len, mem_len)
@@ -255,6 +273,7 @@ class CompressorRetriever(PreTrainedModel):
             input_ids: torch.LongTensor = None,
             inputs_embeds: Optional[torch.FloatTensor] = None,
             output_len: Optional[int] = None,
+            **forward_kwargs
     ):
         assert not all_exists(input_ids, inputs_embeds), 'you should only give either input_ids or inputs_embeds'
 
@@ -266,19 +285,20 @@ class CompressorRetriever(PreTrainedModel):
                 dtype=torch.long
             ).to(input_ids.device)
             concated_inputs = torch.cat((input_ids, output_tokens), dim=-1)
+            outputs = self(input_ids=concated_inputs, return_dict=True, **forward_kwargs)
 
         elif all_exists(inputs_embeds):
             bsize = inputs_embeds.shape[0]
             output_tokens = torch.full((bsize, output_len), self.COM_TOKEN, dtype=torch.long).to(inputs_embeds.device)
             output_embeds = self.mq_embedding(output_tokens)
             concated_inputs = torch.cat((inputs_embeds, output_embeds), dim=1) # (b, s_len, dim) cat at s_len
-
+            outputs = self(inputs_embeds=concated_inputs, return_dict=True, **forward_kwargs)
         else:
             raise ValueError(f'you should give either input_ids or inputs_embeds')
 
         # TODO attention mask to be implemented
 
-        outputs = self(input_ids=concated_inputs, return_dict=True)
+
         assert isinstance(outputs, BaseModelOutputWithPast)
 
         hidden_states = outputs.last_hidden_state
@@ -304,19 +324,20 @@ class CompressorRetriever(PreTrainedModel):
                 dtype=torch.long
             ).to(input_ids.device)
             concated_inputs = torch.cat((input_ids, output_tokens), dim=-1)
+            outputs = self(input_ids=concated_inputs, return_dict=True)
 
         elif all_exists(inputs_embeds):
             bsize = inputs_embeds.shape[0]
             output_tokens = torch.full((bsize, output_len), output_token_id, dtype=torch.long).to(inputs_embeds.device)
             output_embeds = self.mq_embedding(output_tokens)
             concated_inputs = torch.cat((inputs_embeds, output_embeds), dim=1) # (b, s_len, dim) cat at s_len
+            outputs = self(inputs_embeds=concated_inputs, return_dict=True)
 
         else:
             raise ValueError(f'you should give either input_ids or inputs_embeds')
 
         # TODO attention mask to be implemented
 
-        outputs = self(input_ids=concated_inputs, return_dict=True)
         assert isinstance(outputs, BaseModelOutputWithPast)
 
         hidden_states = outputs.last_hidden_state
@@ -340,7 +361,103 @@ class CompressorRetriever(PreTrainedModel):
 
         inputs_embeds = torch.cat((com_embeds, input_embeds), dim=1) # (b, s_len, dim) cat at s_len
 
-        return self.base_causallm.generate(inputs_embeds=inputs_embeds, is_generation=True, **kwargs)
+        return self.base_causallm.generate(inputs_embeds=inputs_embeds, **kwargs)
+
+    def demo_retrieval_generation(
+            self,
+            ctx_ids: torch.LongTensor = None,
+            input_ids: torch.LongTensor = None,
+            ctx_attention_masks: Optional[List] = None,
+            relevant_ctx_ids: Optional[torch.LongTensor] = None,
+            **kwargs
+    ):
+
+        embedded = self.make_embedding(input_ids)
+
+        input_state = self.compress(inputs_embeds=embedded, output_len=1)  # TODO ad hoc state 1
+
+        bsize = ctx_ids.shape[0]
+        # build the mem tree
+        full_mem_trees = []
+        n_ctx = ctx_ids.shape[1]
+        for ctx_ind in range(n_ctx):  # TODO no batch here
+            seg_mem_tree = []
+            ctx_id = ctx_ids[:, ctx_ind, :]
+            cur_seg = self.base_causallm.get_input_embeddings()(ctx_id)
+            # TODO sth wrong with compression_factor, can't get element of it nor do anything
+            for factor in [1, 'single']:
+                if factor == 'single':
+                    output_len = 1
+                    cur_seg = torch.cat([input_state, cur_seg], dim=1)  # (bsize, len, dim)
+                    com_embeds = self.compress(inputs_embeds=cur_seg, output_len=output_len, )
+
+                else:
+                    output_len = 50  # TODO instead of int(cur_seg.shape[1] / factor), we use 50 to cut down cost
+                    cur_seg = torch.cat([input_state, cur_seg], dim=1)  # (bsize, len, dim)
+                    ctx_attention_mask = torch.cat(
+                        [
+                            torch.full(input_state.shape[:2], 1).to(input_state.device),
+                            ctx_attention_masks[:, ctx_ind, :],
+                            torch.full((bsize, output_len), 1).to(input_state.device),
+                        ],
+                        dim=1
+                    )
+                    com_embeds = self.compress(
+                        inputs_embeds=cur_seg,
+                        output_len=output_len,
+                        attention_mask=ctx_attention_mask
+                    )
+
+                seg_mem_tree.append(com_embeds)
+                cur_seg = com_embeds
+
+            full_mem_trees.append(seg_mem_tree[::-1])
+
+        # gather top level and get attn
+        top_mem = torch.cat([mem_tree[0] for mem_tree in full_mem_trees], dim=1)  # (bsize, len, dim)
+        # (bsize, n_ctx, seg_len, dim)
+        main_mem = torch.cat([mem_tree[1][:, None, :, :] for mem_tree in full_mem_trees], dim=1)
+        bsize, n_ctx, seg_len, model_dim = main_mem.shape
+        q_len = 2
+        top_k = 2
+        mem_len = top_mem.shape[1]
+        query_embeds = self.map_forward(inputs_embeds=embedded, output_len=q_len, output_token_id=self.RET_TOKEN)
+
+        outputs = self.base_pretrainedlm(
+            inputs_embeds=torch.cat([top_mem, query_embeds], dim=1),
+            output_attentions=True,
+            return_dict=True,
+        )
+        assert isinstance(outputs, BaseModelOutputWithPast)
+        attn = outputs.attentions[-1]  # (bsize, n_head, mem_len+q_len, mem_len+q_len)
+        # TODO i'm not sure if averaging is good
+        attn = attn.mean(dim=1)
+
+        # Get the attention scores for the last m rows and the first n columns
+        attn_last_m_first_n = attn[:, mem_len:, :mem_len]  # (b, q_len, mem_len)
+
+        # Get the top-k indices and values for each of the m rows
+        topk_vals, topk_indices = torch.topk(attn_last_m_first_n, top_k, dim=-1)
+        topk_softmax = F.softmax(topk_vals, dim=1)  # (bsize, q_len, top_k)
+
+        # (bsize, q_len, top_k, seg_len, dim)
+        ind_expanded = topk_indices[..., None, None].expand(-1, -1, -1, seg_len, model_dim)
+        # (bsize, q_len, n_ctx, seg_len, dim)
+        x_expanded = main_mem[:, None, ...].expand(-1, q_len, -1, -1, -1)
+        # (bsize, q_len, top_k, seg_len, dim)
+        topk_segs = torch.gather(x_expanded, 2, ind_expanded)
+
+        # Compute the weighted sum (bsize, q_len, seg_len, dim)
+        retrieved_mem = torch.sum(topk_segs * topk_softmax[..., None, None], dim=2)
+        # TODO (bsize, q_len * seg_len, dim), this exceeds the q_len quota
+        retrieved_mem = retrieved_mem.view(bsize, -1, model_dim)
+
+        embedded = torch.cat((retrieved_mem, embedded), dim=1)  # (b, s_len, dim) cat at s_len
+
+        # del mem tree and intermediate outputs
+        del outputs, full_mem_trees, attn, top_mem, main_mem, query_embeds, attn_last_m_first_n
+        del kwargs['attention_mask']
+        return self.base_causallm.generate(inputs_embeds=embedded, **kwargs), topk_indices
 
     def prepare_inputs_for_generation(
             self,
