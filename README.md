@@ -2,6 +2,8 @@
 
 [Yuan Yang](https://gblackout.github.io/), [Siheng Xiong](https://dblp.org/pid/277/4221.html), [Ehsan Shareghi](https://eehsan.github.io/) and [Faramarz Fekri](https://fekri.ece.gatech.edu/)
 
+[[Paper](https://arxiv.org/abs/2409.01495)]
+
 ## :construction: This repo is under heavy development
 
 # Overview
